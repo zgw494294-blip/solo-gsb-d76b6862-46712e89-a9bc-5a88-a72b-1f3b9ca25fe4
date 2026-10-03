@@ -53,6 +53,19 @@ clock**（键序无关）判等——同内容忽略，异内容 **409**，缺�
 因果等仍在提交时校验）。封闭会话也可查询；查询不提交会话，也不改动历史、暂存
 与状态。
 
+另外还有一个**只读因果证据批次**接口
+（`POST /api/histories/{id}/evidence-batch`）：给定持久历史 ID 与一组**非空、
+无重复**的 key，从同一已提交历史中取出这些 key 的**全部**事件——包括后来被
+覆盖的 put 与 delete——再递归纳入每条事件的**本副本上一事件**与**其他副本
+clock 非零分量所指事件**；依赖会跨 key 延伸，因此闭包中可能出现只作为依赖
+证据的**辅助 key**，闭包之外的事件一律不加入。返回原 `replica_ids` 与原线格式
+`events`，按 `replica_id`、`seq` 排序，**不重排序号、不改写时钟**，因此整批
+原样通过原完整校验，可**直接**作为 `/api/resolve`、`/api/catchup` 与
+`/api/resolve-conflict` 的请求体重放；所选 key 在证据批次上的裁决与在原历史上
+**完全一致**，辅助 key 的裁决允许不同。历史不存在或任一所选 key 无事件返回
+**404**，非法 `keys`（缺失、为空、含空串/非字符串或有重复）返回 **422**；查询
+不改动历史、导入会话与任何旧接口。
+
 ## 启动
 
 需要 Docker 与 Docker Compose v2（`docker compose` 子命令）。
@@ -85,6 +98,7 @@ docker compose down
 | 暂存一批事件 | `POST http://localhost:8000/api/histories/{id}/import-sessions/{sid}/events` |
 | 提交会话（汇入并封闭） | `POST http://localhost:8000/api/histories/{id}/import-sessions/{sid}/commit` |
 | 查询仍需补取的缺口区间（只读，不提交） | `GET http://localhost:8000/api/histories/{id}/import-sessions/{sid}/missing-ranges` |
+| 提取指定键的因果证据批次（只读，可直接重放） | `POST http://localhost:8000/api/histories/{id}/evidence-batch` |
 | Swagger UI | <http://localhost:8000/docs> |
 | OpenAPI 文档 | <http://localhost:8000/openapi.json> |
 
@@ -547,6 +561,7 @@ SQLite 文件，路径由环境变量 `HISTORY_DB_PATH` 决定；`docker compose
 | `POST` | `/api/histories/{id}/events` | 按 ID 汇入一批事件（请求体只有 `events`） |
 | `POST` | `/api/histories/{id}/resolve-conflict` | 按 ID 提交原冲突处理参数（`key`、`replica_id`、`versions`、`put`/`delete`），不再传整个批次 |
 | `GET` | `/api/histories/{id}/withdraw-preview?replica_id=...&seq=...` | **只读**预演撤除一条事件的波及范围（撤除集合、剩余事件、前后裁决），不改动历史 |
+| `POST` | `/api/histories/{id}/evidence-batch` | **只读**提取指定 key 列表的完整写入记录及其递归因果闭包，返回可直接重放的原格式批次 |
 
 汇入规则：
 
@@ -1442,6 +1457,184 @@ curl -sS -i "http://localhost:8000/api/histories/$HID/import-sessions/$SID/missi
 
 封闭后的会话仍可查询其缺口；历史或会话不存在时分别返回 **404**
 `history_not_found` / `session_not_found`（会话属于其他历史同样按不存在处理）。
+
+## 因果证据批次接口 `POST /api/histories/{id}/evidence-batch`
+
+有时只需把**某几个 key 的完整写入记录**交给另一方核对，而不必整份历史外传。
+本接口从一份**已提交的持久历史**中提取这些 key 的事件及其**因果证据**，返回一
+份**可独立重放**的原格式批次。接口为**只读**：不改动历史、不改动导入会话、不
+影响任何旧接口，可重复查询。
+
+请求体只含 `keys`：一个**非空数组**，元素为**非空字符串且无重复**：
+
+```json
+{ "keys": ["a"] }
+```
+
+提取规则：
+
+1. 取所选 key 的**全部**事件作为种子——包括后来在该 key 上被覆盖的 put 与
+   delete（不是只取当前极大版本）。
+2. 对种子集合按与批次校验相同的**直接依赖边**递归求闭包，每条纳入事件的：
+   - **本副本上一事件**（`seq - 1`，存在时）；
+   - 时钟中**其他副本非零分量**所指事件；
+
+   都一并纳入。依赖**跨 key 也保留**：依赖事件若写的是别的 key，该 key 就作为
+   **辅助 key**随批次带出；闭包之外的事件（例如因果无关的并发写入）一律不加入。
+3. 因为每条纳入事件的本副本前缀与跨副本分量所指事件都在批次内，事件可保持
+   **原始 `seq` 与 `clock`**，无需重编；闭包是每个副本的因果前缀，天然连续。
+
+响应就是原批次形状（`{"replica_ids": ..., "events": ...}`）：
+
+- `replica_ids` 为历史的**原副本列表**（即使闭包中某副本没有事件，其位置与
+  clock 中的零分量也原样保留）；
+- `events` 为**原线格式**事件（`put`/`delete` 二选一、原始 `clock`），按
+  `replica_id`、`seq` 排序；
+- 响应体本身通过原完整校验，可**直接** POST 给 `/api/resolve`、
+  `/api/catchup`（再补一个 `known_clock`）和 `/api/resolve-conflict` 重放；
+- 每个**所选 key** 在证据批次上的裁决与在**原完整历史**上的裁决完全一致
+  （所选 key 的事件一个不少）；**辅助 key** 只提供依赖证据，其在证据批次上的
+  裁决**允许不同**（与该 key 因果无关、闭包之外的事件不会被带出）。
+
+状态码：
+
+- **200**：返回证据批次；
+- **404**：历史不存在（`history_not_found`），或任一**所选 key** 在该历史中
+  没有任何事件（`key_not_found`，错误项带 `key` 字段；多个 key 都不存在时一次
+  性按 key 排序列出全部）；
+- **422**：`keys` 非法——字段缺失、不是数组、数组为空、元素为空串或非字符串
+  （请求体校验错误），或元素有重复（`duplicate_key`）。参数语义校验先于历史
+  查询：即使历史 ID 不存在，重复 key 仍返回 422。
+
+### 23. 跨 key 依赖：提取后直接调用原裁决接口
+
+先创建一份三副本历史：`r1/1` 写 key `a`；`r2/1` 同步过 `r1/1` 后写**另一个
+key** `dep`（clock `r1 = 1`，这是跨 key 依赖）；`r1/2` 依赖本副本上一事件与
+`r2/1`，把 `a` 改成 `"a2"`；`r3/1` 在 key `other` 上完全离线并发写入，与前
+三者无因果关系。
+
+```bash
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2", "r3"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "a", "put": "a1",
+       "clock": {"r1": 1, "r2": 0, "r3": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "dep", "put": "d1",
+       "clock": {"r1": 1, "r2": 1, "r3": 0}},
+      {"replica_id": "r1", "seq": 2, "key": "a", "put": "a2",
+       "clock": {"r1": 2, "r2": 1, "r3": 0}},
+      {"replica_id": "r3", "seq": 1, "key": "other", "put": "z",
+       "clock": {"r1": 0, "r2": 0, "r3": 1}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
+
+只提取 key `a`：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/evidence-batch" \
+  -H 'Content-Type: application/json' \
+  -d '{"keys": ["a"]}'
+```
+
+返回的批次含 `a` 的两条完整记录（包括被覆盖的 `r1/1` put `"a1"`）、跨 key
+依赖事件 `r2/1`（辅助 key `dep`，只作证据）；无关并发的 `r3/1` **不**出现：
+
+```json
+{
+  "replica_ids": ["r1", "r2", "r3"],
+  "events": [
+    {"replica_id": "r1", "seq": 1, "key": "a", "put": "a1",
+     "clock": {"r1": 1, "r2": 0, "r3": 0}},
+    {"replica_id": "r1", "seq": 2, "key": "a", "put": "a2",
+     "clock": {"r1": 2, "r2": 1, "r3": 0}},
+    {"replica_id": "r2", "seq": 1, "key": "dep", "put": "d1",
+     "clock": {"r1": 1, "r2": 1, "r3": 0}}
+  ]
+}
+```
+
+响应体本身就是合法的原裁决请求，保存后可**直接**调用原裁决接口（所选 key `a`
+的裁决与原历史一致，为 put `"a2"`；辅助 key `dep` 仅提供依赖证据）：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/evidence-batch" \
+  -H 'Content-Type: application/json' \
+  -d '{"keys": ["a"]}' > /tmp/evidence.json
+
+curl -sS -X POST http://localhost:8000/api/resolve \
+  -H 'Content-Type: application/json' \
+  --data @/tmp/evidence.json
+```
+
+```json
+{
+  "results": [
+    {"key": "a", "state": "put", "value": "a2",
+     "event": {"replica_id": "r1", "seq": 2, "op": "put", "value": "a2",
+               "clock": {"r1": 2, "r2": 1, "r3": 0}}},
+    {"key": "dep", "state": "put", "value": "d1",
+     "event": {"replica_id": "r2", "seq": 1, "op": "put", "value": "d1",
+               "clock": {"r1": 1, "r2": 1, "r3": 0}}}
+  ]
+}
+```
+
+同一批事件也能直接喂给补传接口——只需在原批次上补一个 `known_clock`，依赖按
+轮解锁（`r1/1` → `r2/1` → `r1/2`）：
+
+```bash
+python3 - <<'EOF'
+import json
+batch = json.load(open("/tmp/evidence.json"))
+batch["known_clock"] = {"r1": 0, "r2": 0, "r3": 0}
+json.dump(batch, open("/tmp/evidence-catchup.json", "w"))
+EOF
+
+curl -sS -X POST http://localhost:8000/api/catchup \
+  -H 'Content-Type: application/json' \
+  --data @/tmp/evidence-catchup.json
+```
+
+若所选 key 在原历史中处于冲突，证据批次同样可以直接交给
+`/api/resolve-conflict`（补上 `key`、`replica_id`、`versions` 与处理结果即可）。
+辅助 key `dep` 在证据批次中的裁决只随依赖证据计算：原历史中任何与
+`r2/1` 并发、闭包之外的 `dep` 写入都不会被带出，因此其批次裁决可能与原历史
+不同，这不影响所选 key `a` 的裁决一致性。
+
+错误示例：
+
+```bash
+# 历史不存在 -> 404 history_not_found
+curl -sS -i -X POST \
+  http://localhost:8000/api/histories/00000000000000000000000000000000/evidence-batch \
+  -H 'Content-Type: application/json' -d '{"keys": ["a"]}'
+
+# 所选 key 在历史中无任何事件 -> 404 key_not_found（带 key 字段）
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/evidence-batch" \
+  -H 'Content-Type: application/json' -d '{"keys": ["nope"]}'
+
+# keys 有重复 -> 422 duplicate_key（空数组、空串、非字符串同为 422）
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/evidence-batch" \
+  -H 'Content-Type: application/json' -d '{"keys": ["a", "a"]}'
+```
+
+```json
+{
+  "detail": [
+    {
+      "code": "key_not_found",
+      "message": "this history has no event with key 'nope'",
+      "key": "nope"
+    }
+  ]
+}
+```
+
+整个查询过程不产生任何写入：再 `GET` 历史，事件与裁决均与提取前一致；已有的
+导入会话（开放或封闭）及其暂存内容也不受影响。
 
 ## 本地开发（不使用 Docker）
 

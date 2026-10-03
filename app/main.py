@@ -76,6 +76,23 @@ seqs from 1 to that bound come back as maximal contiguous closed ranges
 (never enumerated one by one, so a 10**12 bound is still one range).  It
 commits nothing and never changes the history, the staged events or the
 session state.
+
+A read-only evidence-batch endpoint
+(/api/histories/{id}/evidence-batch) extracts, for a non-empty duplicate-free
+list of selected keys, a self-contained causal evidence batch: every event
+touching a selected key (including puts and deletes later overwritten on that
+key) plus the recursive causal closure -- each event's previous event on its
+own replica and the events other replicas' non-zero clock components point at,
+which may themselves touch auxiliary keys that are only carried as
+dependencies.  Nothing outside the closure is added.  The response carries the
+history's original replica_ids and the selected events in original wire
+format, sorted by replica_id then seq, with no renumbered seqs or rewritten
+clocks, so it passes the original batch validation unchanged and can be
+POSTed as-is to /api/resolve, /api/catchup and /api/resolve-conflict.  The
+selected keys' verdicts over the batch equal their verdicts over the whole
+history; an auxiliary key's verdict may differ (it only supplies dependency
+evidence).  Unknown history or a selected key with no event is 404; an illegal
+keys list is 422.  The query is read-only.
 """
 
 from __future__ import annotations
@@ -268,6 +285,26 @@ class MergeEventsRequest(BaseModel):
     ]
 
 
+class EvidenceBatchRequest(BaseModel):
+    """The selected keys whose causal evidence batch is extracted.
+
+    A non-empty list of non-empty, unique keys; structural shape violations
+    (missing/non-list/empty/non-string entries) are schema 422s and duplicate
+    keys are rejected with a ``duplicate_key`` 422 in the same BatchError
+    shape as the other whole-request semantic failures.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    keys: Annotated[
+        list[Annotated[str, Field(min_length=1)]],
+        Field(
+            min_length=1,
+            description="Non-empty list of non-empty, unique keys to extract.",
+        ),
+    ]
+
+
 class StageEventsRequest(BaseModel):
     """A session append: 1+ raw events, no hard cap on the request length.
 
@@ -328,6 +365,14 @@ class EventNotFound(Exception):
         super().__init__(f"event ({replica_id!r}, {seq}) not found")
         self.replica_id = replica_id
         self.seq = seq
+
+
+class SelectedKeyNotFound(Exception):
+    """A selected key has no event in the referenced history (404)."""
+
+    def __init__(self, keys: list[str]):
+        super().__init__(f"selected key(s) not found: {keys!r}")
+        self.keys = keys
 
 
 class SessionNotFound(Exception):
@@ -1031,7 +1076,7 @@ def resolve(events: list[Event], replica_ids: list[str]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Read-only withdrawal preview
+# Read-only projections: withdrawal preview, evidence-batch extraction
 # ---------------------------------------------------------------------------
 
 
@@ -1123,6 +1168,69 @@ def preview_withdrawal(
         "events": [_canonical_wire(ev, replica_ids) for ev in kept],
         "changes": changes,
     }
+
+
+def build_evidence_batch(
+    replica_ids: list[str],
+    events: list[Event],
+    keys: list[str],
+) -> list[Event]:
+    """Extract the independently replayable causal evidence batch for keys.
+
+    The seeds are every event whose key is selected (all of them, including
+    puts and deletes later overwritten on that key).  The seed set is then
+    closed under the same forward dependency edges used by batch validation
+    and the withdrawal preview: each included event's previous event on its
+    own replica (``seq - 1``) and, for every other replica, the event its
+    non-zero clock component points at.  Cross-key dependencies are kept, so
+    events on auxiliary keys enter the batch solely as dependency evidence;
+    no event outside the closure is added.  Stored histories have passed
+    batch validation, so every referenced identity exists.
+
+    The closure is a causal prefix per replica: whenever seq N on a replica
+    is included, seq 1..N-1 on that replica are included transitively, and
+    every cross-replica component points at an included event.  The selected
+    events therefore keep their original seqs and clocks and the subset
+    passes the original ``validate_batch`` unchanged, which is re-run as a
+    guarantee before return.
+
+    A selected key with no event raises SelectedKeyNotFound (-> 404); every
+    missing key is reported together, sorted.
+    """
+
+    by_key: dict[str, list[Event]] = {}
+    for ev in events:
+        by_key.setdefault(ev.key, []).append(ev)
+
+    missing = sorted({k for k in keys if k not in by_key})
+    if missing:
+        raise SelectedKeyNotFound(missing)
+
+    by_id = {(ev.replica_id, ev.seq): ev for ev in events}
+    included: set[tuple[str, int]] = set()
+    frontier: list[tuple[str, int]] = []
+    for key in keys:
+        for ev in by_key[key]:
+            ident = (ev.replica_id, ev.seq)
+            if ident not in included:
+                included.add(ident)
+                frontier.append(ident)
+
+    # Recursive causal closure: own-replica predecessor plus the events other
+    # replicas' non-zero clock components point at (cross-key included).
+    while frontier:
+        ident = frontier.pop()
+        for dep in _direct_dependencies(by_id[ident], replica_ids):
+            if dep not in included:
+                included.add(dep)
+                frontier.append(dep)
+
+    batch = [ev for ev in events if (ev.replica_id, ev.seq) in included]
+
+    # The construction guarantees validity, but re-run the original full
+    # validation so the returned batch is replayable by construction.
+    validate_batch(replica_ids, batch)
+    return batch
 
 
 # ---------------------------------------------------------------------------
@@ -1527,6 +1635,25 @@ async def event_not_found_handler(
     )
 
 
+@app.exception_handler(SelectedKeyNotFound)
+async def selected_key_not_found_handler(
+    request: Request, exc: SelectedKeyNotFound
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": [
+                {
+                    "code": "key_not_found",
+                    "message": f"this history has no event with key {key!r}",
+                    "key": key,
+                }
+                for key in exc.keys
+            ]
+        },
+    )
+
+
 @app.exception_handler(SessionNotFound)
 async def session_not_found_handler(
     request: Request, exc: SessionNotFound
@@ -1716,6 +1843,62 @@ def preview_history_event_withdrawal(
     hid, replica_ids, events = _load_row(row)
     preview = preview_withdrawal(replica_ids, events, replica_id, seq)
     return {"id": hid, **preview}
+
+
+@app.post(
+    "/api/histories/{history_id}/evidence-batch",
+    tags=["histories"],
+    response_model=None,
+)
+def extract_history_evidence_batch(
+    history_id: str, body: EvidenceBatchRequest
+) -> dict:
+    """Extract a self-contained causal evidence batch for selected keys.
+
+    Read-only: the stored history is fetched as one committed snapshot and
+    never written back.  The response is a plain original-format batch --
+    the history's ``replica_ids`` plus every selected-key event (including
+    overwritten puts and deletes) closed under causal dependencies: each
+    event's previous event on its own replica and the events other replicas'
+    non-zero clock components point at, across keys.  Auxiliary keys are
+    carried only as dependency evidence.  Events keep their original seqs
+    and clocks, sorted by replica_id then seq; the batch passes the original
+    validation and can be POSTed unchanged to /api/resolve, /api/catchup and
+    /api/resolve-conflict, where the selected keys resolve exactly as in the
+    full history (auxiliary keys may resolve differently).  An unknown
+    history or a selected key without any event is 404; an illegal keys list
+    (missing, empty, non-string entries or duplicates) is 422.
+    """
+
+    # Whole-request semantic checks (duplicate keys) are 422 before the
+    # history lookup, mirroring validate_batch's duplicate_replica_id rule.
+    keys = body.keys
+    seen_keys: set[str] = set()
+    duplicate_keys: set[str] = set()
+    for key in keys:
+        if key in seen_keys:
+            duplicate_keys.add(key)
+        seen_keys.add(key)
+    if duplicate_keys:
+        raise BatchError(
+            [
+                {
+                    "code": "duplicate_key",
+                    "message": f"key {key!r} appears more than once in keys",
+                }
+                for key in sorted(duplicate_keys)
+            ]
+        )
+
+    row = store.get_history(history_id)
+    if row is None:
+        raise HistoryNotFound(history_id)
+    _, replica_ids, events = _load_row(row)
+    batch = build_evidence_batch(replica_ids, events, keys)
+    return {
+        "replica_ids": list(replica_ids),
+        "events": _canonical_events(batch, replica_ids),
+    }
 
 
 @app.post(
