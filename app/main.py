@@ -38,6 +38,22 @@ events remain, and every changed key is shown with its before/after verdict
 (null after when the key empties).  It never modifies the stored history,
 renumbers seqs or rewrites clocks.
 
+A read-only evidence-extraction endpoint
+(/api/histories/{id}/evidence?keys=...) repackages the complete write
+records of selected keys from one committed history into a standalone,
+replayable causal evidence batch: every event of the selected keys
+(overwritten puts and deletes included), plus the recursive dependency
+closure -- each event's previous event on its own replica and the events
+its non-zero clock components point at on other replicas, across keys --
+and nothing outside that closure.  The response carries the original
+replica_ids and the events in their original wire format, sorted by
+replica_id then seq, with no renumbering; the batch passes the original
+validation unchanged, so it replays straight through /api/resolve and
+/api/catchup, and every selected key's verdict is identical to the full
+history's (auxiliary keys, pulled in only as dependency evidence, may
+resolve differently).  It never modifies the stored history, the import
+sessions, or any other endpoint's behaviour.
+
 A third family of endpoints (/api/histories/{id}/import-sessions) stages
 offline events that arrive in several batches into an import session before
 they touch the persistent history.  A session is created empty by history
@@ -328,6 +344,14 @@ class EventNotFound(Exception):
         super().__init__(f"event ({replica_id!r}, {seq}) not found")
         self.replica_id = replica_id
         self.seq = seq
+
+
+class KeyNotFound(Exception):
+    """A history exists but has no events for one or more requested keys (404)."""
+
+    def __init__(self, keys: list[str]):
+        super().__init__(f"no events for keys {keys!r}")
+        self.keys = keys
 
 
 class SessionNotFound(Exception):
@@ -1126,6 +1150,55 @@ def preview_withdrawal(
 
 
 # ---------------------------------------------------------------------------
+# Read-only causal evidence extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_evidence(
+    replica_ids: list[str], events: list[Event], keys: list[str]
+) -> list[Event]:
+    """Dependency closure of one committed history over the requested keys.
+
+    Seeds with *every* event of the requested keys (overwritten puts and
+    deletes included), then recursively adds each event's direct
+    dependencies -- the previous event on its own replica and the events
+    its non-zero clock components point at on other replicas -- across
+    keys, until nothing new appears.  Nothing outside that closure is
+    included.  Stored histories have passed batch validation, so every
+    referenced identity exists.
+
+    The closure keeps every causal predecessor of every included event, so
+    the returned events still pass the original batch validation unchanged
+    (per-replica seqs stay contiguous from 1 and every clock component
+    still points at an included event), and each requested key keeps its
+    full event set, hence its full-history verdict.  Returns the closure
+    events sorted by replica_id then seq, with original seqs and clocks.
+    """
+
+    seen = {(ev.replica_id, ev.seq): ev for ev in events}
+    wanted = set(keys)
+
+    closure: set[tuple[str, int]] = set()
+    frontier: list[tuple[str, int]] = []
+    for ev in events:
+        if ev.key in wanted:
+            ident = (ev.replica_id, ev.seq)
+            if ident not in closure:
+                closure.add(ident)
+                frontier.append(ident)
+
+    while frontier:
+        ev = seen[frontier.pop()]
+        for dep in _direct_dependencies(ev, replica_ids):
+            if dep not in closure:
+                closure.add(dep)
+                frontier.append(dep)
+
+    ordered = sorted(events, key=lambda e: (e.replica_id, e.seq))
+    return [ev for ev in ordered if (ev.replica_id, ev.seq) in closure]
+
+
+# ---------------------------------------------------------------------------
 # Conflict resolution event
 # ---------------------------------------------------------------------------
 
@@ -1527,6 +1600,25 @@ async def event_not_found_handler(
     )
 
 
+@app.exception_handler(KeyNotFound)
+async def key_not_found_handler(
+    request: Request, exc: KeyNotFound
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": [
+                {
+                    "code": "key_not_found",
+                    "message": f"this history has no events for key {key!r}",
+                    "key": key,
+                }
+                for key in exc.keys
+            ]
+        },
+    )
+
+
 @app.exception_handler(SessionNotFound)
 async def session_not_found_handler(
     request: Request, exc: SessionNotFound
@@ -1716,6 +1808,80 @@ def preview_history_event_withdrawal(
     hid, replica_ids, events = _load_row(row)
     preview = preview_withdrawal(replica_ids, events, replica_id, seq)
     return {"id": hid, **preview}
+
+
+@app.get(
+    "/api/histories/{history_id}/evidence",
+    tags=["histories"],
+    response_model=None,
+)
+def extract_key_evidence(
+    history_id: str,
+    keys: Annotated[
+        list[Annotated[str, Field(min_length=1)]],
+        Query(
+            min_length=1,
+            description=(
+                "Keys whose complete write records are extracted; repeat "
+                "the parameter for several keys (?keys=a&keys=b). "
+                "Non-empty strings, no duplicates."
+            ),
+        ),
+    ],
+) -> dict:
+    """Extract the complete write records of the given keys as one
+    independently replayable causal evidence batch.
+
+    Read-only: the stored history is fetched as one committed snapshot and
+    never written back.  The batch contains every event of the requested
+    keys (overwritten puts and deletes included) plus the recursive
+    dependency closure -- each event's previous event on its own replica
+    and the events its non-zero clock components point at on other
+    replicas, across keys -- and nothing outside that closure.  The
+    response carries the original ``replica_ids`` and the events in their
+    original wire format, sorted by replica_id then seq, with no
+    renumbering of seqs or clocks, so it passes the original batch
+    validation unchanged and can be replayed straight through /api/resolve
+    and /api/catchup.  Every requested key's verdict over the batch is
+    identical to the full history's; events of other keys appear only as
+    dependency evidence and their verdicts may differ.  Unknown history ->
+    404; any requested key without events -> 404; missing, empty or
+    duplicate keys -> 422.
+    """
+
+    seen_keys: set[str] = set()
+    duplicate_keys: set[str] = set()
+    for k in keys:
+        if k in seen_keys:
+            duplicate_keys.add(k)
+        seen_keys.add(k)
+    if duplicate_keys:
+        raise BatchError(
+            [
+                _err(
+                    "duplicate_key",
+                    "keys must contain no duplicates; repeated "
+                    f"{sorted(duplicate_keys)}",
+                )
+            ]
+        )
+
+    row = store.get_history(history_id)
+    if row is None:
+        raise HistoryNotFound(history_id)
+    hid, replica_ids, events = _load_row(row)
+
+    present = {ev.key for ev in events}
+    missing = sorted(set(keys) - present)
+    if missing:
+        raise KeyNotFound(missing)
+
+    kept = extract_evidence(replica_ids, events, keys)
+    return {
+        "id": hid,
+        "replica_ids": list(replica_ids),
+        "events": [_canonical_wire(ev, replica_ids) for ev in kept],
+    }
 
 
 @app.post(

@@ -29,6 +29,13 @@
 所有直接或间接依赖它的事件（跨 key）都会计入，无关并发事件保留；只返回预演
 结果，**不实际删除、不重排序号或时钟、不改动已提交历史**。
 
+另有一个**只读的因果证据提取**接口：给定已提交历史的 ID 与若干键，把这些键的
+**完整写入记录**（含已被覆盖的 put/delete）连同递归依赖闭包（本副本上一事件、
+其他副本 clock 非零分量所指事件，跨键依赖同样保留）提取成一份**可独立重放的
+因果证据批次**——原 `replica_ids`、原格式事件、原序号与时钟，可直接重放原裁决
+与补传接口；所选键的裁决与原历史一致，被依赖顺带带入的辅助键只提供依赖证据。
+查询不改动历史、会话与旧接口。
+
 最后是一组**导入会话**接口（`/api/histories/{id}/import-sessions`）：离线事件
 分几次到达时，先按历史 ID 开一个空会话，把每批事件**暂存**进去（暂存对**新
 标识**事件只校验单事件本身，允许前序或跨副本依赖尚未到达；对已暂存及同批
@@ -80,6 +87,7 @@ docker compose down
 | 汇入离线事件 | `POST http://localhost:8000/api/histories/{id}/events` |
 | 提交冲突处理 | `POST http://localhost:8000/api/histories/{id}/resolve-conflict` |
 | 撤除预演（只读，不落任何写入） | `GET http://localhost:8000/api/histories/{id}/withdraw-preview?replica_id=r1&seq=1` |
+| 因果证据提取（只读，可独立重放批次） | `GET http://localhost:8000/api/histories/{id}/evidence?keys=name&keys=session` |
 | 创建导入会话 | `POST http://localhost:8000/api/histories/{id}/import-sessions` |
 | 查询会话状态与暂存事件 | `GET http://localhost:8000/api/histories/{id}/import-sessions/{sid}` |
 | 暂存一批事件 | `POST http://localhost:8000/api/histories/{id}/import-sessions/{sid}/events` |
@@ -547,6 +555,7 @@ SQLite 文件，路径由环境变量 `HISTORY_DB_PATH` 决定；`docker compose
 | `POST` | `/api/histories/{id}/events` | 按 ID 汇入一批事件（请求体只有 `events`） |
 | `POST` | `/api/histories/{id}/resolve-conflict` | 按 ID 提交原冲突处理参数（`key`、`replica_id`、`versions`、`put`/`delete`），不再传整个批次 |
 | `GET` | `/api/histories/{id}/withdraw-preview?replica_id=...&seq=...` | **只读**预演撤除一条事件的波及范围（撤除集合、剩余事件、前后裁决），不改动历史 |
+| `GET` | `/api/histories/{id}/evidence?keys=...` | **只读**提取指定键的完整写入记录与递归依赖闭包，返回可独立重放的原格式批次 |
 
 汇入规则：
 
@@ -1442,6 +1451,170 @@ curl -sS -i "http://localhost:8000/api/histories/$HID/import-sessions/$SID/missi
 
 封闭后的会话仍可查询其缺口；历史或会话不存在时分别返回 **404**
 `history_not_found` / `session_not_found`（会话属于其他历史同样按不存在处理）。
+
+## 因果证据提取接口 `GET /api/histories/{id}/evidence`
+
+把指定键的**完整写入记录**从一份已提交历史中提取成一份**可独立重放的因果证据
+批次**。接口为**只读**：不改动历史、导入会话或任何旧接口，响应取自同一次读取的
+同一已提交快照。
+
+查询参数：
+
+- `keys`：要提取的键；提取多个键时重复传入（`?keys=a&keys=b`）。列表非空、
+  元素为非空字符串且无重复，违反返回 **422**。
+
+批次内容（取自同一已提交历史）：
+
+1. 先纳入每个所选键的**全部**事件——包括已被覆盖的 put 与 delete；
+2. 再递归纳入每条入选事件的**直接依赖**（与批次校验相同的依赖边）：本副本上一
+   事件（`seq - 1`）以及其他副本 clock 非零分量所指事件，**跨键依赖同样保留**；
+3. 除此之外不加入任何闭包之外的事件（无关并发事件、未被依赖的其他键事件都不
+   纳入）。
+
+响应：
+
+- `id`：历史 ID；
+- `replica_ids`：原历史的副本列表（原样）；
+- `events`：闭包事件的**原线格式**（`put`/`delete` 二选一、原始 `clock`），按
+  `replica_id`、`seq` 排序，**不重编序号或时钟**。
+
+依赖闭包保留了每条入选事件的全部因果前驱，因此返回批次**原样通过原完整校验**，
+可直接作为 `replica_ids` + `events` 调用原裁决接口 `/api/resolve` 与补传接口
+`/api/catchup`。所选键在提取批次中的裁决与原历史**完全一致**（其全部事件都在
+批次中）；被依赖事件顺带带入的**辅助键只提供依赖证据**，其事件可能不全，裁决
+允许与原历史不同。
+
+状态码：
+
+- **200**：提取完成；
+- **404**：历史不存在（`history_not_found`），或任一所选键在历史中没有任何
+  事件（`key_not_found`，`detail` 一次性列出全部缺失键）；
+- **422**：`keys` 缺失、含空字符串或有重复（`duplicate_key`）。
+
+### 23. 跨键依赖：提取后调用原裁决接口，辅助键只提供依赖证据
+
+`r2/1` 写 `name` 之前同步过 `r1/2`——而 `r1/2` 写的是另一个键 `session`，
+这是一条**跨键依赖**。此外 `r2/3` 是 `session` 的后续写入，`r3/1` 是完全无关
+的并发 `config` 写入：
+
+```bash
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2", "r3"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0, "r3": 0}},
+      {"replica_id": "r1", "seq": 2, "key": "session", "put": "s1",
+       "clock": {"r1": 2, "r2": 0, "r3": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+       "clock": {"r1": 2, "r2": 1, "r3": 0}},
+      {"replica_id": "r1", "seq": 3, "key": "name", "delete": "delete",
+       "clock": {"r1": 3, "r2": 1, "r3": 0}},
+      {"replica_id": "r2", "seq": 2, "key": "name", "put": "bob2",
+       "clock": {"r1": 2, "r2": 2, "r3": 0}},
+      {"replica_id": "r2", "seq": 3, "key": "session", "put": "s2",
+       "clock": {"r1": 2, "r2": 3, "r3": 0}},
+      {"replica_id": "r3", "seq": 1, "key": "config", "put": "c1",
+       "clock": {"r1": 0, "r2": 0, "r3": 1}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+```
+
+提取 `name` 的完整写入记录：
+
+```bash
+curl -sS -G "http://localhost:8000/api/histories/$HID/evidence" \
+  --data-urlencode 'keys=name'
+```
+
+`name` 的全部 4 条事件都在（含已被覆盖的 `r1/1`、`r2/1` 两条 put 与 delete
+`r1/3`）；`r1/2`（`session`）作为 `r2/1` 的跨键依赖被一并纳入；`r2/3`
+（`session` 的后续）与 `r3/1`（无关 `config`）不在闭包中：
+
+```json
+{
+  "id": "…",
+  "replica_ids": ["r1", "r2", "r3"],
+  "events": [
+    {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+     "clock": {"r1": 1, "r2": 0, "r3": 0}},
+    {"replica_id": "r1", "seq": 2, "key": "session", "put": "s1",
+     "clock": {"r1": 2, "r2": 0, "r3": 0}},
+    {"replica_id": "r1", "seq": 3, "key": "name", "delete": "delete",
+     "clock": {"r1": 3, "r2": 1, "r3": 0}},
+    {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+     "clock": {"r1": 2, "r2": 1, "r3": 0}},
+    {"replica_id": "r2", "seq": 2, "key": "name", "put": "bob2",
+     "clock": {"r1": 2, "r2": 2, "r3": 0}}
+  ]
+}
+```
+
+把响应中的 `replica_ids` 与 `events` 原样发给**原裁决接口**（提取只读，历史
+并未改变，这里验证的是批次可以脱离原历史独立重放）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/resolve \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2", "r3"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0, "r3": 0}},
+      {"replica_id": "r1", "seq": 2, "key": "session", "put": "s1",
+       "clock": {"r1": 2, "r2": 0, "r3": 0}},
+      {"replica_id": "r1", "seq": 3, "key": "name", "delete": "delete",
+       "clock": {"r1": 3, "r2": 1, "r3": 0}},
+      {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+       "clock": {"r1": 2, "r2": 1, "r3": 0}},
+      {"replica_id": "r2", "seq": 2, "key": "name", "put": "bob2",
+       "clock": {"r1": 2, "r2": 2, "r3": 0}}
+    ]
+  }'
+```
+
+批次通过原完整校验；`name` 的裁决与原历史**完全一致**（`r1/3` 的 delete 与
+`r2/2` 的 put 冲突）。辅助键 `session` 只有依赖证据 `r1/2`，裁决为 `s1`——
+与原历史的 `s2`（被 `r2/3` 覆盖）不同，这是允许的：**辅助键只提供依赖证据**，
+不保证裁决一致；`config` 则完全不在批次中：
+
+```json
+{
+  "results": [
+    {
+      "key": "name",
+      "state": "conflict",
+      "events": [
+        {"replica_id": "r1", "seq": 3, "op": "delete", "value": null,
+         "clock": {"r1": 3, "r2": 1, "r3": 0}},
+        {"replica_id": "r2", "seq": 2, "op": "put", "value": "bob2",
+         "clock": {"r1": 2, "r2": 2, "r3": 0}}
+      ]
+    },
+    {
+      "key": "session",
+      "state": "put",
+      "value": "s1",
+      "event": {"replica_id": "r1", "seq": 2, "op": "put", "value": "s1",
+                "clock": {"r1": 2, "r2": 0, "r3": 0}}
+    }
+  ]
+}
+```
+
+同一批次也可直接传给 `/api/catchup`（附 `known_clock`）：依赖闭包保证每个
+缺失事件都能按依赖分轮补传。错误示例：
+
+```bash
+# 所选键不存在 -> 404 key_not_found（detail 列出全部缺失键）
+curl -sS -i -G "http://localhost:8000/api/histories/$HID/evidence" \
+  --data-urlencode 'keys=name' --data-urlencode 'keys=nope'
+
+# 键重复 -> 422 duplicate_key
+curl -sS -i -G "http://localhost:8000/api/histories/$HID/evidence" \
+  --data-urlencode 'keys=name' --data-urlencode 'keys=name'
+```
 
 ## 本地开发（不使用 Docker）
 

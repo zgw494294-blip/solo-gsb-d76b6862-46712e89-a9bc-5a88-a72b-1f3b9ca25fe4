@@ -3136,3 +3136,222 @@ def test_missing_ranges_is_read_only_under_repeated_queries():
     assert session_get(hid, sid).json()["status"] == "open"
     assert len(session_get(hid, sid).json()["events"]) == 1
 
+
+
+# ---------------------------------------------------------------------------
+# Read-only causal evidence extraction
+# ---------------------------------------------------------------------------
+
+
+def hist_evidence(hid, *keys):
+    return client.get(
+        f"/api/histories/{hid}/evidence",
+        params=[("keys", k) for k in keys],
+    )
+
+
+def evidence_seed():
+    """Cross-key dependency chain plus unrelated/tail events outside it.
+
+    r2/1 (name) synced r1/2 (session) before writing -- a cross-key
+    dependency.  r2/3 (session tail) and r3/1 (unrelated config) lie
+    outside the dependency closure of the "name" events.
+    """
+    return [
+        ev("r1", 1, "name", put="alice", clock={"r1": 1, "r2": 0, "r3": 0}),
+        ev("r1", 2, "session", put="s1", clock={"r1": 2, "r2": 0, "r3": 0}),
+        ev("r2", 1, "name", put="bob", clock={"r1": 2, "r2": 1, "r3": 0}),
+        ev("r1", 3, "name", delete="delete",
+           clock={"r1": 3, "r2": 1, "r3": 0}),
+        ev("r2", 2, "name", put="bob2", clock={"r1": 2, "r2": 2, "r3": 0}),
+        ev("r2", 3, "session", put="s2", clock={"r1": 2, "r2": 3, "r3": 0}),
+        ev("r3", 1, "config", put="c1", clock={"r1": 0, "r2": 0, "r3": 1}),
+    ]
+
+
+def create_evidence_history():
+    r = hist_create(["r1", "r2", "r3"], evidence_seed())
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_evidence_extracts_key_closure_with_cross_key_dependencies():
+    hid = create_evidence_history()
+    before = hist_get(hid).json()
+
+    r = hist_evidence(hid, "name")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["id"] == hid
+    assert data["replica_ids"] == ["r1", "r2", "r3"]
+    # All four "name" events (overwritten puts and the delete included),
+    # plus r1/2 ("session") pulled in as r2/1's cross-key dependency.
+    # r2/3 ("session" tail) and r3/1 (unrelated "config") stay out.
+    # Original wire format, sorted by replica_id then seq, nothing
+    # renumbered.
+    assert data["events"] == [
+        ev("r1", 1, "name", put="alice", clock={"r1": 1, "r2": 0, "r3": 0}),
+        ev("r1", 2, "session", put="s1", clock={"r1": 2, "r2": 0, "r3": 0}),
+        ev("r1", 3, "name", delete="delete",
+           clock={"r1": 3, "r2": 1, "r3": 0}),
+        ev("r2", 1, "name", put="bob", clock={"r1": 2, "r2": 1, "r3": 0}),
+        ev("r2", 2, "name", put="bob2", clock={"r1": 2, "r2": 2, "r3": 0}),
+    ]
+    # Read-only: the committed history is byte-for-byte unchanged.
+    assert hist_get(hid).json() == before
+
+
+def test_evidence_batch_replays_through_resolve_and_catchup():
+    hid = create_evidence_history()
+    data = hist_evidence(hid, "name").json()
+
+    # The extracted batch passes the original validation unchanged, and
+    # the selected key's verdict is identical to the full history's.
+    rr = post(data["replica_ids"], data["events"])
+    assert rr.status_code == 200, rr.text
+    extracted = {x["key"]: x for x in rr.json()["results"]}
+    original = {x["key"]: x for x in hist_get(hid).json()["results"]}
+    assert extracted["name"] == original["name"]
+    assert extracted["name"]["state"] == "conflict"
+
+    # The auxiliary key only carries dependency evidence: r2/3 never made
+    # it into the batch, so its verdict may (and does) differ.
+    assert original["session"]["value"] == "s2"
+    assert extracted["session"] == {
+        "key": "session",
+        "state": "put",
+        "value": "s1",
+        "event": {
+            "replica_id": "r1",
+            "seq": 2,
+            "op": "put",
+            "value": "s1",
+            "clock": {"r1": 2, "r2": 0, "r3": 0},
+        },
+    }
+    assert "config" not in extracted
+
+    # The same batch is directly schedulable by the original catch-up
+    # endpoint: the dependency closure makes every round satisfiable.
+    cr = post_catchup(
+        data["replica_ids"], data["events"], {"r1": 0, "r2": 0, "r3": 0}
+    )
+    assert cr.status_code == 200, cr.text
+    rounds = cr.json()["rounds"]
+    assert [[(e["replica_id"], e["seq"]) for e in rnd] for rnd in rounds] == [
+        [("r1", 1)],
+        [("r1", 2)],
+        [("r2", 1)],
+        [("r1", 3), ("r2", 2)],
+    ]
+    assert cr.json()["progress"] == {"r1": 3, "r2": 2, "r3": 0}
+
+
+def test_evidence_multiple_keys_union_their_closures():
+    hid = create_evidence_history()
+    data = hist_evidence(hid, "name", "config").json()
+    assert [(e["replica_id"], e["seq"]) for e in data["events"]] == [
+        ("r1", 1),
+        ("r1", 2),
+        ("r1", 3),
+        ("r2", 1),
+        ("r2", 2),
+        ("r3", 1),
+    ]
+    # r2/3 ("session" tail) is still outside the closure.
+
+
+def test_evidence_selected_key_verdict_matches_even_when_auxiliary_does_not():
+    hid = create_evidence_history()
+    data = hist_evidence(hid, "session").json()
+    # r2/3 depends on r2/2 -> r2/1 -> r1/2 -> r1/1: the "name" events r2/1
+    # and r2/2 arrive as dependency evidence, but the "name" delete r1/3
+    # and the unrelated r3/1 stay out.
+    assert [(e["replica_id"], e["seq"]) for e in data["events"]] == [
+        ("r1", 1),
+        ("r1", 2),
+        ("r2", 1),
+        ("r2", 2),
+        ("r2", 3),
+    ]
+    rr = post(data["replica_ids"], data["events"])
+    assert rr.status_code == 200, rr.text
+    extracted = {x["key"]: x for x in rr.json()["results"]}
+    original = {x["key"]: x for x in hist_get(hid).json()["results"]}
+    # Selected key: its full event set is present -> identical verdict.
+    assert extracted["session"] == original["session"]
+    # Auxiliary key "name" lacks r1/3, so its verdict may differ.
+    assert extracted["name"] != original["name"]
+    assert extracted["name"]["state"] == "put"
+    assert extracted["name"]["value"] == "bob2"
+
+
+def test_evidence_single_event_key_replays_as_one_event_batch():
+    hid = create_evidence_history()
+    data = hist_evidence(hid, "config").json()
+    # r3/1 has no dependencies: the closure is exactly the one event.
+    assert data["events"] == [
+        ev("r3", 1, "config", put="c1", clock={"r1": 0, "r2": 0, "r3": 1})
+    ]
+    rr = post(data["replica_ids"], data["events"])
+    assert rr.status_code == 200, rr.text
+    (item,) = rr.json()["results"]
+    assert item["key"] == "config"
+    assert item["state"] == "put"
+    assert item["value"] == "c1"
+
+
+def test_evidence_unknown_history_is_404():
+    r = hist_evidence("0" * 32, "name")
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "history_not_found"
+
+
+def test_evidence_missing_key_is_404_and_lists_all_missing():
+    hid = create_evidence_history()
+    r = hist_evidence(hid, "name", "nope", "also-missing")
+    assert r.status_code == 404
+    detail = r.json()["detail"]
+    assert all(e["code"] == "key_not_found" for e in detail)
+    assert [e["key"] for e in detail] == ["also-missing", "nope"]
+
+
+def test_evidence_invalid_keys_are_422():
+    hid = create_evidence_history()
+
+    # No keys parameter at all.
+    r = client.get(f"/api/histories/{hid}/evidence")
+    assert r.status_code == 422, r.text
+
+    # Empty key string.
+    r = hist_evidence(hid, "")
+    assert r.status_code == 422, r.text
+
+    # Duplicated key.
+    r = hist_evidence(hid, "name", "session", "name")
+    assert r.status_code == 422, r.text
+    assert any(e.get("code") == "duplicate_key" for e in r.json()["detail"])
+
+
+def test_evidence_is_read_only_and_leaves_sessions_untouched():
+    hid = create_evidence_history()
+    sid = create_session(hid)
+    assert (
+        session_append(
+            hid,
+            sid,
+            [ev("r1", 4, "name", put="staged",
+                clock={"r1": 4, "r2": 2, "r3": 0})],
+        ).status_code
+        == 200
+    )
+    before_hist = hist_get(hid).json()
+    before_session = session_get(hid, sid).json()
+
+    first = hist_evidence(hid, "name")
+    assert first.status_code == 200, first.text
+    # Staged events are not part of the committed history; repeated
+    # extractions are identical and nothing changes underneath.
+    assert hist_evidence(hid, "name").json() == first.json()
+    assert hist_get(hid).json() == before_hist
+    assert session_get(hid, sid).json() == before_session
